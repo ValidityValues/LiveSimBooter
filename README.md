@@ -53,6 +53,9 @@ Use the setup guide for current commands; older notes describe earlier cache lay
 
 ## Development checks
 
+For automated Apple Silicon tests and an unsigned device build, see the [GitHub Actions workflow](docs/github-actions.md).
+It validates the source/build pipeline but does not sign, install, or provision a complete simulator runtime.
+
 On an Apple Silicon Mac with Xcode:
 
 ```sh
