@@ -134,15 +134,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          DERIVED_DATA="$RUNNER_TEMP/lsb-ci/DerivedData"
+          PRODUCTS_DIR="$RUNNER_TEMP/lsb-ci/products"
           LOG="$RUNNER_TEMP/lsb-ci/xcodebuild.log"
+          mkdir -p "$PRODUCTS_DIR"
           if ! xcodebuild \
             -project LiveSimBooter.xcodeproj \
             -target LiveSimBooter \
             -configuration Release \
             -sdk iphoneos \
             -arch arm64 \
-            -derivedDataPath "$DERIVED_DATA" \
+            CONFIGURATION_BUILD_DIR="$PRODUCTS_DIR" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY= \
@@ -153,7 +154,7 @@ jobs:
             exit 1
           fi
           tail -n 100 "$LOG"
-          APP_PATH="$DERIVED_DATA/Build/Products/Release-iphoneos/LiveSimBooter.app"
+          APP_PATH="$PRODUCTS_DIR/LiveSimBooter.app"
           test -d "$APP_PATH"
           test -f "$APP_PATH/LiveSimBooter"
           test -d "$APP_PATH/PlugIns/LiveProcess.appex"
