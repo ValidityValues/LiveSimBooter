@@ -62,11 +62,7 @@ jobs:
           import pathlib
           import subprocess
 
-          info = json.loads(pathlib.Path(
-              subprocess.check_output(
-                  ["xcrun", "simctl", "list", "runtimes", "-j"], text=True
-              ) and "/dev/null"
-          ).read_text()) if False else json.loads(subprocess.check_output(
+          info = json.loads(subprocess.check_output(
               ["xcrun", "simctl", "list", "runtimes", "-j"], text=True
           ))
           exact = [
