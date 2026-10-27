@@ -1,0 +1,205 @@
+name: Apple Silicon CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Tests and unsigned iOS build
+    # The repository's Xcode project was upgraded with Xcode 27 and the
+    # test suite explicitly targets arm64.
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Inspect Apple Silicon and Xcode environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lsb-ci"
+          {
+            echo "Commit: $GITHUB_SHA"
+            echo "Runner: $RUNNER_NAME"
+            echo "Architecture: $(uname -m)"
+            sw_vers
+            echo
+            xcodebuild -version
+            echo
+            xcode-select -p
+            echo
+            xcodebuild -showsdks
+            echo
+            echo "Free disk:"
+            df -h "$RUNNER_TEMP"
+          } | tee "$RUNNER_TEMP/lsb-ci/environment.txt"
+          test "$(uname -m)" = "arm64"
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphonesimulator --show-sdk-path
+
+      - name: Inventory installed simulator runtimes
+        id: runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun simctl list runtimes -j > "$RUNNER_TEMP/lsb-ci/runtime-inventory.json"
+          cat "$RUNNER_TEMP/lsb-ci/runtime-inventory.json"
+          RUNTIME_ROOT="$(python3 - <<'PY'
+          import glob
+          import json
+          import pathlib
+          import subprocess
+
+          info = json.loads(pathlib.Path(
+              subprocess.check_output(
+                  ["xcrun", "simctl", "list", "runtimes", "-j"], text=True
+              ) and "/dev/null"
+          ).read_text()) if False else json.loads(subprocess.check_output(
+              ["xcrun", "simctl", "list", "runtimes", "-j"], text=True
+          ))
+          exact = [
+              item for item in info.get("runtimes", [])
+              if item.get("version") == "26.0"
+              and item.get("buildversion", item.get("buildVersion", "")) == "23A343"
+              and item.get("isAvailable", True)
+          ]
+          patterns = (
+              "/Library/Developer/CoreSimulator/Volumes/iOS_23A343/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.0.simruntime/Contents/Resources/RuntimeRoot",
+              "/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.0.simruntime/Contents/Resources/RuntimeRoot",
+              "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.0.simruntime/Contents/Resources/RuntimeRoot",
+          )
+          candidates = []
+          for pattern in patterns:
+              candidates.extend(glob.glob(pattern))
+          for root in candidates:
+              path = pathlib.Path(root)
+              resolved = str(path.resolve())
+              if not path.is_dir():
+                  continue
+              # Prefer the mounted volume name, which encodes the exact build.
+              if "23A343" in resolved:
+                  print(resolved)
+                  raise SystemExit(0)
+          if exact and len(candidates) == 1 and pathlib.Path(candidates[0]).is_dir():
+              print(str(pathlib.Path(candidates[0]).resolve()))
+              raise SystemExit(0)
+          raise SystemExit(0)
+          PY
+          )"
+          if [[ -n "$RUNTIME_ROOT" ]]; then
+            echo "runtime_root=$RUNTIME_ROOT" >> "$GITHUB_OUTPUT"
+            echo "Found an iOS 26.0 / 23A343 runtime root: $RUNTIME_ROOT"
+          else
+            echo "runtime_root=" >> "$GITHUB_OUTPUT"
+            echo "Exact iOS Simulator 26.0 / 23A343 runtime not installed; runtime validation will be skipped."
+          fi
+
+      - name: Validate original 23A343 cache inputs (when present)
+        if: steps.runtime.outputs.runtime_root != ''
+        shell: bash
+        env:
+          LSB_RUNTIME_ROOT: ${{ steps.runtime.outputs.runtime_root }}
+        run: |
+          set -euo pipefail
+          python3 Tools/setup-ios26-cache.py \
+            --runtime-root "$LSB_RUNTIME_ROOT" \
+            --validate-only > "$RUNNER_TEMP/lsb-ci/cache-preflight.json"
+          cat "$RUNNER_TEMP/lsb-ci/cache-preflight.json"
+
+      - name: Run native test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! sh Tests/run.sh > "$RUNNER_TEMP/lsb-ci/tests.log" 2>&1; then
+            tail -n 250 "$RUNNER_TEMP/lsb-ci/tests.log"
+            exit 1
+          fi
+          tail -n 100 "$RUNNER_TEMP/lsb-ci/tests.log"
+
+      - name: Audit callback and handoff objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 Tests/audit-local-runtime.py 2>&1 | tee "$RUNNER_TEMP/lsb-ci/runtime-audit.log"
+
+      - name: Build unsigned iOS app and extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          DERIVED_DATA="$RUNNER_TEMP/lsb-ci/DerivedData"
+          LOG="$RUNNER_TEMP/lsb-ci/xcodebuild.log"
+          if ! xcodebuild \
+            -project LiveSimBooter.xcodeproj \
+            -target LiveSimBooter \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            LSB_ENABLE_NATIVE_STACK_RESERVATION=NO \
+            build > "$LOG" 2>&1; then
+            tail -n 250 "$LOG"
+            exit 1
+          fi
+          tail -n 100 "$LOG"
+          APP_PATH="$DERIVED_DATA/Build/Products/Release-iphoneos/LiveSimBooter.app"
+          test -d "$APP_PATH"
+          test -f "$APP_PATH/LiveSimBooter"
+          test -d "$APP_PATH/PlugIns/LiveProcess.appex"
+          test -f "$APP_PATH/PlugIns/LiveProcess.appex/LiveProcess"
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
+            "$APP_PATH" "$RUNNER_TEMP/lsb-ci/LiveSimBooter-unsigned.app.zip"
+          python3 - "$APP_PATH" > "$RUNNER_TEMP/lsb-ci/build-manifest.txt" <<'PY'
+          import pathlib
+          import plistlib
+          import subprocess
+          import sys
+
+          app = pathlib.Path(sys.argv[1])
+          info = plistlib.loads((app / "Info.plist").read_bytes())
+          extension = app / "PlugIns" / "LiveProcess.appex"
+          extension_info = plistlib.loads((extension / "Info.plist").read_bytes())
+          print(f"App: {app.name}")
+          print(f"App bundle identifier: {info.get('CFBundleIdentifier', '<missing>')}")
+          print(f"App executable: {app / info.get('CFBundleExecutable', '')}")
+          print(f"Extension bundle identifier: {extension_info.get('CFBundleIdentifier', '<missing>')}")
+          print("Signing: disabled (CI verification build; not installable as-is)")
+          for executable in (
+              app / info.get("CFBundleExecutable", ""),
+              extension / extension_info.get("CFBundleExecutable", ""),
+          ):
+              print(f"\n{executable}")
+              print(subprocess.check_output(["file", str(executable)], text=True).strip())
+          PY
+
+      - name: Upload CI reports and unsigned build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: livesimbooter-ci-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/lsb-ci/environment.txt
+            ${{ runner.temp }}/lsb-ci/runtime-inventory.json
+            ${{ runner.temp }}/lsb-ci/cache-preflight.json
+            ${{ runner.temp }}/lsb-ci/tests.log
+            ${{ runner.temp }}/lsb-ci/runtime-audit.log
+            ${{ runner.temp }}/lsb-ci/xcodebuild.log
+            ${{ runner.temp }}/lsb-ci/build-manifest.txt
+            ${{ runner.temp }}/lsb-ci/LiveSimBooter-unsigned.app.zip
+          if-no-files-found: warn
+          retention-days: 7
